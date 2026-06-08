@@ -5,6 +5,7 @@ writes everything to Supabase. Traders authenticate with backend sessions,
 rqfc API keys, or legacy Supabase JWTs.
 """
 from pathlib import Path
+from datetime import datetime, timezone
 import json
 import secrets
 
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 from . import alpaca_client as alp
 from . import db, metrics
+from . import accounting
 from .auth import (
     api_key_prefix,
     authenticate_with_supabase,
@@ -284,7 +286,10 @@ def _live_pod_snapshot(pod: dict) -> dict:
         "cash": None,
         "gross_notional": 0.0,
         "net_notional": 0.0,
+        "realized_pnl": 0.0,
         "unrealized_pnl": 0.0,
+        "total_pnl": 0.0,
+        "fees": 0.0,
         "live_gain": 0.0,
         "daily_return": None,
         "session_return": None,
@@ -293,42 +298,110 @@ def _live_pod_snapshot(pod: dict) -> dict:
     }
     try:
         account = alp.get_account(pod["id"])
-        positions = alp.get_positions(pod["id"])
-        gross = 0.0
-        net = 0.0
-        pnl = 0.0
-        for position in positions:
-            quantity = float(position.get("quantity") or 0)
-            price = position.get("current_price")
-            market_value = position.get("market_value")
-            if market_value is None and price is not None:
-                market_value = quantity * float(price)
-                position["market_value"] = round(market_value, 2)
-            value = float(market_value or 0)
-            gross += abs(value)
-            net += value
-            pnl += float(position.get("unrealized_pnl") or 0)
-
+        positions, totals = _marked_portfolio_from_fills(pod["id"])
+        if not positions:
+            positions = alp.get_positions(pod["id"])
+            totals = _totals_from_live_positions(positions)
         nav = float(account.get("portfolio_value") or account.get("equity") or snapshot["nav"])
         allocated = snapshot["allocated_capital"]
         snapshot.update({
             "live": True,
-            "source": "alpaca",
+            "source": "alpaca_fills_market_data",
             "account": account,
             "positions": positions,
             "nav": nav,
             "cash": float(account.get("cash") or 0),
-            "gross_notional": round(gross, 2),
-            "net_notional": round(net, 2),
-            "unrealized_pnl": round(pnl, 2),
+            **totals,
             "live_gain": round(nav - allocated, 2),
             "daily_return": account.get("session_return"),
             "session_return": account.get("session_return"),
             "total_return": ((nav / allocated) - 1) if allocated else None,
         })
+        db.replace_position_marks(pod["id"], positions)
+        db.insert_portfolio_mark(pod["id"], {
+            "cash": snapshot["cash"],
+            "equity": account.get("equity"),
+            "portfolio_value": nav,
+            "gross_notional": snapshot["gross_notional"],
+            "net_notional": snapshot["net_notional"],
+            "realized_pnl": snapshot["realized_pnl"],
+            "unrealized_pnl": snapshot["unrealized_pnl"],
+            "total_pnl": snapshot["total_pnl"],
+            "source": snapshot["source"],
+        })
     except Exception as e:
+        derived_positions, totals = _marked_portfolio_from_fills(pod["id"], sync_alpaca=False)
+        if derived_positions:
+            allocated = snapshot["allocated_capital"]
+            snapshot.update({
+                "live": True,
+                "source": "recorded_fills_market_data",
+                "positions": derived_positions,
+                "nav": round(allocated + totals["total_pnl"], 2),
+                **totals,
+                "live_gain": totals["total_pnl"],
+                "total_return": (totals["total_pnl"] / allocated) if allocated else None,
+            })
         snapshot["error"] = str(getattr(e, "detail", e))
     return snapshot
+
+
+def _marked_portfolio_from_fills(pod_id: str, sync_alpaca: bool = True) -> tuple[list[dict], dict]:
+    fills = []
+    trades = db.list_pod_trades_for_marking(pod_id)
+    trade_by_order = {str(t.get("alpaca_order_id")): t for t in trades if t.get("alpaca_order_id")}
+    if sync_alpaca:
+        try:
+            alpaca_fills = []
+            for fill in alp.get_fill_activities(pod_id):
+                trade = trade_by_order.get(str(fill.get("alpaca_order_id"))) or {}
+                instrument = accounting.parse_instrument(fill.get("symbol"), trade.get("asset_class"))
+                multiplier = instrument["multiplier"]
+                alpaca_fills.append({
+                    **fill,
+                    "trade_id": trade.get("id"),
+                    "trader_id": trade.get("trader_id"),
+                    "asset_class": trade.get("asset_class"),
+                    **instrument,
+                    "multiplier": multiplier,
+                    "notional": abs(float(fill["quantity"]) * float(fill["price"]) * multiplier),
+                })
+            db.upsert_order_fills(pod_id, alpaca_fills)
+        except Exception:
+            pass
+    fills = db.list_order_fills(pod_id)
+    if not fills:
+        fills = [f for f in (accounting.fill_from_trade(t) for t in trades) if f]
+
+    state = accounting.build_portfolio(fills)
+    symbols = [symbol for symbol, pos in state.positions.items() if abs(pos.quantity) > 1e-9]
+    try:
+        prices = alp.get_latest_prices(pod_id, symbols) if symbols else {}
+    except Exception:
+        prices = {}
+    return accounting.mark_positions(state, prices)
+
+
+def _totals_from_live_positions(positions: list[dict]) -> dict:
+    gross = 0.0
+    net = 0.0
+    unrealized = 0.0
+    for position in positions:
+        value = float(position.get("market_value") or 0)
+        gross += abs(value)
+        net += value
+        unrealized += float(position.get("unrealized_pnl") or 0)
+        position.setdefault("realized_pnl", 0.0)
+        position.setdefault("total_pnl", position.get("unrealized_pnl") or 0.0)
+        position.setdefault("multiplier", accounting.parse_instrument(position.get("symbol")).get("multiplier", 1))
+    return {
+        "gross_notional": round(gross, 2),
+        "net_notional": round(net, 2),
+        "realized_pnl": 0.0,
+        "unrealized_pnl": round(unrealized, 2),
+        "total_pnl": round(unrealized, 2),
+        "fees": 0.0,
+    }
 
 
 @app.get("/public/live")
@@ -362,12 +435,26 @@ def public_notional_history(pod_id: str, minutes: int = 390):
     if not db.get_pod(pod_id):
         raise HTTPException(404, "Pod not found.")
     try:
-        return {
-            "pod_id": pod_id,
-            "timeframe": "1Min",
-            "rows": alp.get_position_notional_history(pod_id, minutes),
-        }
+        rows = alp.get_position_notional_history(pod_id, minutes)
+        if not rows:
+            positions, _ = _marked_portfolio_from_fills(pod_id)
+            holdings = {p["symbol"]: float(p["quantity"]) for p in positions if float(p.get("quantity") or 0) != 0}
+            rows = alp.get_notional_history_for_holdings(pod_id, holdings, minutes) if holdings else []
+        return {"pod_id": pod_id, "timeframe": "1Min", "rows": rows}
     except Exception as e:
+        positions, _ = _marked_portfolio_from_fills(pod_id, sync_alpaca=False)
+        if positions:
+            gross = sum(abs(float(p.get("market_value") or 0)) for p in positions)
+            net = sum(float(p.get("market_value") or 0) for p in positions)
+            return {
+                "pod_id": pod_id,
+                "timeframe": "1Min",
+                "rows": [{
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "gross_notional": round(gross, 2),
+                    "net_notional": round(net, 2),
+                }],
+            }
         raise HTTPException(status_code=400, detail=str(getattr(e, "detail", e)))
 
 
