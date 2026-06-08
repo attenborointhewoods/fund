@@ -1,0 +1,22 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight. Change to '0 */6 * * *' for every 6 hours.
+  workflow_dispatch: # Allows you to manually trigger the sync via a button.
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+
+      - name: Sync Upstream
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
+        with:
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          upstream_repository: ORIGINAL_OWNER/ORIGINAL_REPO # e.g., facebook/react
+          upstream_branch: main
+          target_branch: main
+          test_mode: false
