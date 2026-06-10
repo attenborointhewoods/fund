@@ -8,6 +8,7 @@ storing secrets in the DB.
 This is the ONLY place Alpaca keys are used. They never leave the backend.
 """
 from datetime import datetime, timedelta, timezone
+import time
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 import json
@@ -24,10 +25,11 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 from .config import get_settings
 from . import db
-from .accounting import parse_instrument
+from .accounting import parse_instrument, parse_ts
 
 
 # ── Credential resolution ────────────────────────────────────────────────────
@@ -99,23 +101,48 @@ def submit_order(pod_id: str, *, symbol: str, side: str, qty: float = None,
         req = MarketOrderRequest(symbol=sym, qty=qty, notional=notional,
                                  side=order_side, time_in_force=_tif(time_in_force))
     try:
-        return tc.submit_order(req)
+        order = tc.submit_order(req)
+        return _refresh_order(tc, order)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Alpaca rejected the order: {e}")
 
 
-def to_trade_row(order, order_type_label: str, asset_class: str) -> dict:
+def _refresh_order(tc: TradingClient, order):
+    """Briefly refresh a submitted order so market fills have qty/price when available."""
+    order_id = getattr(order, "id", None)
+    if not order_id:
+        return order
+    for _ in range(3):
+        status = str(getattr(getattr(order, "status", None), "value", getattr(order, "status", ""))).lower()
+        if status in {"filled", "partially_filled", "canceled", "expired", "rejected"}:
+            return order
+        time.sleep(0.35)
+        try:
+            order = tc.get_order_by_id(order_id)
+        except Exception:
+            return order
+    return order
+
+
+def _num(value) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def to_trade_row(order, order_type_label: str, asset_class: str,
+                 requested_qty: float = None, requested_notional: float = None) -> dict:
     """Map an Alpaca order onto the `trades` table columns."""
     instrument = parse_instrument(order.symbol, asset_class)
     multiplier = float(instrument["multiplier"])
-    qty          = float(order.qty) if order.qty else None
-    filled_qty   = float(order.filled_qty) if order.filled_qty else None
-    filled_price = float(order.filled_avg_price) if order.filled_avg_price else None
-    limit_price  = float(order.limit_price) if getattr(order, "limit_price", None) else None
+    qty          = _num(getattr(order, "qty", None)) or requested_qty
+    filled_qty   = _num(getattr(order, "filled_qty", None))
+    filled_price = _num(getattr(order, "filled_avg_price", None))
+    limit_price  = _num(getattr(order, "limit_price", None))
 
     quantity = qty if qty is not None else filled_qty
     price    = filled_price if filled_price is not None else limit_price
-    notional = float(order.notional) if order.notional else (
+    notional = _num(getattr(order, "notional", None)) or requested_notional or (
         round(abs(quantity * price * multiplier), 2) if (quantity is not None and price is not None) else None
     )
     submitted = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
@@ -200,27 +227,35 @@ def get_fill_activities(pod_id: str, days: int = 90) -> list[dict]:
 def get_positions(pod_id: str) -> list:
     positions = trading_client(pod_id).get_all_positions()
     symbols = [p.symbol for p in positions]
-    latest_prices = get_latest_prices(pod_id, symbols) if symbols else {}
+    try:
+        latest_prices = get_latest_prices(pod_id, symbols) if symbols else {}
+    except Exception:
+        latest_prices = {}
     rows = []
     for p in positions:
-        quantity = float(p.qty)
-        avg_entry = float(p.avg_entry_price)
+        instrument = parse_instrument(p.symbol)
+        multiplier = float(instrument.get("multiplier") or 1)
+        quantity = _num(getattr(p, "qty", None)) or 0.0
+        avg_entry = _num(getattr(p, "avg_entry_price", None)) or 0.0
+        alpaca_current = _num(getattr(p, "current_price", None))
         latest_price = latest_prices.get(p.symbol)
-        current_price = latest_price if latest_price is not None else (
-            float(p.current_price) if p.current_price else None
-        )
-        market_value = (quantity * current_price) if current_price is not None else (
-            float(p.market_value) if p.market_value else None
-        )
-        unrealized_pnl = ((current_price - avg_entry) * quantity) if current_price is not None else (
-            float(p.unrealized_pl) if p.unrealized_pl else None
-        )
+        current_price = alpaca_current if alpaca_current is not None else latest_price
+        market_value = _num(getattr(p, "market_value", None))
+        if market_value is None and current_price is not None:
+            market_value = quantity * current_price * multiplier
+        unrealized_pnl = _num(getattr(p, "unrealized_pl", None))
+        if unrealized_pnl is None and current_price is not None:
+            unrealized_pnl = (current_price - avg_entry) * quantity * multiplier
         rows.append({
             "symbol":          p.symbol,
+            "instrument_type": instrument["instrument_type"],
+            "underlying_symbol": instrument["underlying_symbol"],
             "quantity":        quantity,
             "avg_entry_price": avg_entry,
             "current_price":   round(current_price, 4) if current_price is not None else None,
             "market_value":    round(market_value, 2) if market_value is not None else None,
+            "cost_basis":      _num(getattr(p, "cost_basis", None)),
+            "multiplier":      multiplier,
             "unrealized_pnl":  round(unrealized_pnl, 2) if unrealized_pnl is not None else None,
         })
     return rows
@@ -349,6 +384,52 @@ def _accumulate_notional_bars(by_ts: dict, bars_by_symbol: dict, holdings: dict[
             row["net_notional"] += value
 
 
+def get_minute_closes(
+    pod_id: str, symbols: list[str], start: datetime,
+) -> dict[str, list[tuple[datetime, float]]]:
+    """1Min close series per symbol — the market data behind the live NAV chart.
+
+    Stocks come from the bars API (falling back to the free IEX feed when the
+    account's plan rejects recent SIP data); options from the options bars API.
+    Returns {symbol: [(minute_timestamp, close), ...]} sorted by time.
+    """
+    upper = [s.upper() for s in symbols]
+    option_symbols = [s for s in upper if parse_instrument(s)["instrument_type"] == "option"]
+    stock_symbols = [s for s in upper if s not in option_symbols]
+    out: dict[str, list[tuple[datetime, float]]] = {}
+
+    if stock_symbols:
+        dc = data_client(pod_id)
+        req = StockBarsRequest(symbol_or_symbols=stock_symbols, timeframe=TimeFrame.Minute, start=start)
+        try:
+            bars_by_symbol = dc.get_stock_bars(req).data
+        except Exception:
+            req = StockBarsRequest(
+                symbol_or_symbols=stock_symbols, timeframe=TimeFrame.Minute,
+                start=start, feed=DataFeed.IEX,
+            )
+            bars_by_symbol = dc.get_stock_bars(req).data
+        for sym, bars in bars_by_symbol.items():
+            out[sym] = [
+                (b.timestamp.replace(second=0, microsecond=0), float(b.close)) for b in bars
+            ]
+
+    if option_symbols:
+        try:
+            for sym, rows in get_option_bars(pod_id, option_symbols, start).items():
+                pts = []
+                for row in rows:
+                    ts = parse_ts(row.get("timestamp"))
+                    if ts is not None:
+                        pts.append((ts.replace(second=0, microsecond=0), float(row["close"])))
+                if pts:
+                    out[sym] = sorted(pts)
+        except Exception:
+            pass
+
+    return {sym: sorted(pts) for sym, pts in out.items()}
+
+
 def get_option_bars(pod_id: str, symbols: list[str], start: datetime) -> dict[str, list[dict]]:
     if not symbols:
         return {}
@@ -421,6 +502,34 @@ def get_latest_prices(pod_id: str, symbols: list[str]) -> dict[str, float]:
             except Exception:
                 continue
         return prices
+
+
+def get_snapshots(pod_id: str, symbols: list[str]) -> dict[str, dict]:
+    """Latest price + daily change for a basket of stocks (powers the ticker tape).
+
+    Uses the multi-symbol snapshot endpoint so the whole basket is one request.
+    Returns {symbol: {"price": float, "change_pct": float}}.
+    """
+    if not symbols:
+        return {}
+    upper = [s.upper() for s in symbols]
+    params = urlencode({"symbols": ",".join(upper)})
+    url = f"https://data.alpaca.markets/v2/stocks/snapshots?{params}"
+    data = _get_json(url, _alpaca_headers(pod_id))
+    snapshots = data.get("snapshots", data) if isinstance(data, dict) else {}
+    out: dict[str, dict] = {}
+    for symbol, snap in (snapshots or {}).items():
+        if not isinstance(snap, dict):
+            continue
+        latest = (snap.get("latestTrade") or {}).get("p")
+        if latest is None:
+            latest = (snap.get("dailyBar") or {}).get("c")
+        prev_close = (snap.get("prevDailyBar") or {}).get("c")
+        if latest is None:
+            continue
+        change_pct = ((float(latest) / float(prev_close) - 1) * 100) if prev_close else 0.0
+        out[symbol] = {"price": round(float(latest), 2), "change_pct": round(change_pct, 2)}
+    return out
 
 
 def get_bars(pod_id: str, symbol: str, days: int = 30) -> list:

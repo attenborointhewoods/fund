@@ -5,9 +5,10 @@ writes everything to Supabase. Traders authenticate with backend sessions,
 rqfc API keys, or legacy Supabase JWTs.
 """
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import secrets
+import time
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -234,13 +235,27 @@ def place_order(req: OrderRequest, trader: dict = Depends(get_current_trader)):
         raise HTTPException(404, "Pod not found.")
     if not req.qty and not req.notional:
         raise HTTPException(400, "Provide either qty or notional.")
+    if req.qty and req.notional:
+        raise HTTPException(400, "Provide either qty or notional, not both.")
+    if req.notional and req.order_type.lower() != "market":
+        raise HTTPException(400, "Alpaca only supports notional orders for market orders.")
+    if req.notional and req.time_in_force.lower() != "day":
+        raise HTTPException(400, "Alpaca notional orders must use time_in_force='day'.")
+    if req.order_type.lower() == "limit" and not req.qty:
+        raise HTTPException(400, "Limit orders require qty.")
 
     order = alp.submit_order(
         req.pod_id, symbol=req.symbol, side=req.side, qty=req.qty,
         notional=req.notional, order_type=req.order_type,
         limit_price=req.limit_price, time_in_force=req.time_in_force,
     )
-    row = alp.to_trade_row(order, req.order_label, pod["asset_class"])
+    row = alp.to_trade_row(
+        order,
+        req.order_label,
+        pod["asset_class"],
+        requested_qty=req.qty,
+        requested_notional=req.notional,
+    )
     db.log_trade(req.pod_id, trader["id"], row)
     return {"order_id": row["alpaca_order_id"], "status": row["status"], "trade": row}
 
@@ -294,6 +309,8 @@ def _live_pod_snapshot(pod: dict) -> dict:
         "daily_return": None,
         "session_return": None,
         "total_return": None,
+        "members": db.list_pod_members(pod["id"]),
+        "nav_series": db.get_nav_series(pod["id"]),
         "error": None,
     }
     try:
@@ -404,6 +421,72 @@ def _totals_from_live_positions(positions: list[dict]) -> dict:
     }
 
 
+# ── Live 1-minute NAV series (powers the center chart) ───────────────────────
+
+_NAV_SERIES_CACHE: dict = {"at": 0.0, "minutes": None, "payload": None}
+_NAV_SERIES_TTL = 50  # seconds — 1Min bars only change once a minute
+
+
+def _pod_fills(pod_id: str) -> list[dict]:
+    """Recorded fills for a pod, falling back to the trade log."""
+    fills = db.list_order_fills(pod_id)
+    if not fills:
+        trades = db.list_pod_trades_for_marking(pod_id)
+        fills = [f for f in (accounting.fill_from_trade(t) for t in trades) if f]
+    return fills
+
+
+def _minute_nav_for_pod(pod: dict, minutes: int) -> list[dict]:
+    """Replay a pod's fills against live 1Min market bars → minute NAV series.
+
+    When the requested window has no bars (market closed), reaches back to the
+    most recent session so the chart always shows real 1-minute market data.
+    Falls back to the recorded nav history only if market data is unavailable.
+    """
+    allocated = float(pod.get("allocated_capital") or 0)
+    fills = _pod_fills(pod["id"])
+    if not fills:
+        return db.get_nav_series(pod["id"])
+    symbols = sorted({f["symbol"] for f in fills if f.get("symbol")})
+    try:
+        start = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        closes = alp.get_minute_closes(pod["id"], symbols, start)
+        if not all(closes.get(s) for s in symbols):
+            week = alp.get_minute_closes(pod["id"], symbols, datetime.now(timezone.utc) - timedelta(days=5))
+            closes = {s: pts[-minutes:] for s, pts in week.items() if pts}
+    except Exception:
+        closes = {}
+    series = accounting.minute_nav_series(fills, closes, allocated) if closes else []
+    return series or db.get_nav_series(pod["id"])
+
+
+@app.get("/public/nav-series")
+def public_nav_series(minutes: int = 390):
+    """1-minute live account value of every pod, marked to 1Min market bars.
+
+    Cached briefly server-side since minute bars only change once a minute.
+    """
+    minutes = max(30, min(int(minutes or 390), 1440))
+    now = time.time()
+    if (
+        _NAV_SERIES_CACHE["payload"] is not None
+        and _NAV_SERIES_CACHE["minutes"] == minutes
+        and now - _NAV_SERIES_CACHE["at"] < _NAV_SERIES_TTL
+    ):
+        return _NAV_SERIES_CACHE["payload"]
+    pods = db.sb().table("pods").select("*").order("created_at").execute().data or []
+    payload = {
+        "timeframe": "1Min",
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "pods": [
+            {"pod_id": p["id"], "name": p["name"], "series": _minute_nav_for_pod(p, minutes)}
+            for p in pods
+        ],
+    }
+    _NAV_SERIES_CACHE.update({"at": now, "minutes": minutes, "payload": payload})
+    return payload
+
+
 @app.get("/public/live")
 def public_live_snapshots():
     """Public transparency feed. Never returns credentials or trader identities."""
@@ -456,6 +539,67 @@ def public_notional_history(pod_id: str, minutes: int = 390):
                 }],
             }
         raise HTTPException(status_code=400, detail=str(getattr(e, "detail", e)))
+
+
+# ── Public market ticker (powers the sliding stock tape) ──────────────────────
+
+TICKER_SYMBOLS = [
+    "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "GOOGL", "META",
+    "SPY", "QQQ", "AMD", "NFLX", "JPM", "COIN", "INTC", "PLTR",
+]
+
+
+@app.get("/public/ticker")
+def public_ticker(symbols: str = None):
+    """Latest price + daily change for a basket of popular stocks. Public, no auth.
+
+    Market data needs only Alpaca data-API keys; we resolve them via any pod's
+    credentials or the backend env (no pod-specific account is touched).
+    """
+    requested = [s.strip().upper() for s in symbols.split(",")] if symbols else TICKER_SYMBOLS
+    pods = db.sb().table("pods").select("id").limit(1).execute().data or []
+    creds_pod = pods[0]["id"] if pods else "__ticker__"
+    try:
+        snaps = alp.get_snapshots(creds_pod, requested)
+        items = [
+            {"symbol": sym, "price": snaps[sym]["price"], "change_pct": snaps[sym]["change_pct"]}
+            for sym in requested if sym in snaps
+        ]
+    except Exception:
+        items = []
+    return {"items": items}
+
+
+@app.get("/public/trades")
+def public_trades(pod_id: str = None, limit: int = 100):
+    """Public completed-trades feed (order log + pod/trader names). No credentials."""
+    if pod_id and not db.get_pod(pod_id):
+        raise HTTPException(404, "Pod not found.")
+    return {"trades": db.list_public_trades(pod_id=pod_id, limit=limit)}
+
+
+@app.get("/public/leaderboard")
+def public_leaderboard():
+    """Per-pod aggregated standings, marked to live market data. No credentials."""
+    pods = db.sb().table("pods").select("*").order("created_at").execute().data or []
+    rows = []
+    for pod in pods:
+        snap = _live_pod_snapshot(pod)
+        allocated = snap["allocated_capital"] or 0
+        rows.append({
+            "pod_id": pod["id"],
+            "name": pod["name"],
+            "asset_class": pod.get("asset_class"),
+            "account_value": snap["nav"],
+            "allocated_capital": allocated,
+            "total_pnl": snap["total_pnl"],
+            "realized_pnl": snap["realized_pnl"],
+            "unrealized_pnl": snap["unrealized_pnl"],
+            "total_return": snap["total_return"],
+            "live": snap["live"],
+        })
+    rows.sort(key=lambda r: (r["total_return"] is not None, r["total_return"] or 0), reverse=True)
+    return {"pods": rows}
 
 
 # ── Market data (any authenticated trader) ────────────────────────────────────
